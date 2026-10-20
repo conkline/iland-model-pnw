@@ -99,6 +99,7 @@ private:
     double mKBDIref; ///< reference value for KBDI drought index
     double mRefMgmt; ///< r_mgmt (fire suppression value)
     double mRefLand; ///< fixed multiplier for the fire spread probabilites (e.g. for riparian land) [0..1], default 1
+    double mRefugiaModifier; ///< NEW 10/2026 tuning parameter for fire refugia effect
     double mRefAnnualPrecipitation; ///< mean annual precipitation (mm)
     double mFireReturnInterval; ///< mean fire return interval (yrs)
     double mAverageFireSize; ///< mean average fire size (m2)
@@ -205,7 +206,10 @@ private:
 
     /// prepare the necessary data grid to allow burn ins
     void setupBorderGrid();
-
+    
+    // set up refugia data
+    void setupRefugia(const ResourceUnit *ru, FireRUData &fire_data);
+    
     int mFireId; ///< running id of a fire event
     // parameters
     double mWindSpeedMin;
@@ -215,6 +219,12 @@ private:
     double mCurrentWindDirection;
     double mPrescribedFiresize; // fire size from javascript
     double mMinimumFuel; ///< minimum fuel for fire (kg biomass/ha)
+    // Topo-climatic fire refugia
+    bool mRefugiaEnabled;
+    bool mRefugiaAffectSpread;
+    bool mRefugiaAffectSeverity;
+    double mRefugiaAlpha;
+    QString mRefugiaRasterPath;
     // fuel parameters
     double mFuelkFC1; ///< params (Schumacher 2006) to calculate amount of fuel
     double mFuelkFC2;
@@ -240,6 +250,7 @@ private:
     Grid<FireRUData> mRUGrid; ///< grid with data values per resource unit
     Grid<float> mGrid; ///< fire grid (20x20m)
     Grid<char> mBorderGrid; ///< 20x20m grid where border pixels are flagged
+    Grid<float> mRefugiaInputGrid; ///< input refugia potential raster (100x100m)
     FireLayers mFireLayers;
     FireScript *mFireScript;
 

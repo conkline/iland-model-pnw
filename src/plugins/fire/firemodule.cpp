@@ -90,6 +90,7 @@ double FireLayers::value(const FireRUData &data, const int param_index) const
     case 9: return data.fireRUStats.year_last_fire; // year of the last fire event on a cell
     case 10: { double moss, ff, dwd;   // total fuel that would burn in a fire (current climatic conditions)
                return mFireModule->calcCombustibleFuel(data, moss, ff, dwd); }
+    case 11: return data.mRefugiaModifier;
     default: throw IException(QString("invalid variable index for FireData: %1").arg(param_index));
     }
 }
@@ -108,7 +109,8 @@ const QVector<LayeredGridBase::LayerElement> &FireLayers::names()
                 << LayeredGridBase::LayerElement(QStringLiteral("fuel"), QStringLiteral("burned fuel (forest floor + dwd + moss) kg/ha"), GridViewRainbow)
                 << LayeredGridBase::LayerElement(QStringLiteral("nFire"), QStringLiteral("cumulative count of fires"), GridViewRainbow)
                 << LayeredGridBase::LayerElement(QStringLiteral("lastFireYear"), QStringLiteral("sim. year of last burn"), GridViewRainbow)
-                << LayeredGridBase::LayerElement(QStringLiteral("combustibleFuel"), QStringLiteral("available combustible fuel (current KBDI, forest floor + dwd + moss) kg/ha"), GridViewRainbow);
+                << LayeredGridBase::LayerElement(QStringLiteral("combustibleFuel"), QStringLiteral("available combustible fuel (current KBDI, forest floor + dwd + moss) kg/ha"), GridViewRainbow)
+                << LayeredGridBase::LayerElement(QStringLiteral("refugiaModifier"), QStringLiteral("topo-climatic refugia fuel modifier"), GridViewRainbow);
 
     return mNames;
 
@@ -170,6 +172,50 @@ void FireModule::setup()
     mCrownKillkCK1 = xml.valueDouble(".crownKill1", 0.21111);
     mCrownKillkCK2 = xml.valueDouble(".crownKill2", -0.00445);
     mCrownKillDbh = xml.valueDouble(".crownKillDbh", 40.);
+    
+    // Topo-climatic fire refugia configuration
+    mRefugiaEnabled = xml.valueBool(".refugiaEnabled", false);
+    mRefugiaAffectSpread = xml.valueBool(".refugiaAffectSpread", false);
+    mRefugiaAffectSeverity = xml.valueBool(".refugiaAffectSeverity", false);
+    mRefugiaAlpha = xml.valueDouble(".refugiaAlpha", 1.0);
+    mRefugiaRasterPath = xml.value(".refugiaRaster", "");
+    
+    // Validate tuning parameter
+    if (mRefugiaAlpha < 0.0 || mRefugiaAlpha > 1.0) {
+      throw IException("FireModule: refugiaAlpha must be between 0 and 1.");
+    }
+    
+    // Require an input raster when refugia effects are enabled
+    if (mRefugiaEnabled && mRefugiaRasterPath.isEmpty()) {throw IException("FireModule: refugia is enabled but no refugiaRaster was specified.");}
+    
+    if (mRefugiaEnabled) {
+      
+      // Load the 100-m refugia potential raster
+      if (!mRefugiaInputGrid.loadGridFromFile(mRefugiaRasterPath)) {
+        throw IException(QString("FireModule: could not load refugia raster: %1")
+          .arg(mRefugiaRasterPath)
+        );
+      }
+      
+      // Verify raster resolution
+      if (qAbs(mRefugiaInputGrid.cellsize() -mRUGrid.cellsize()) > 0.001) {
+        throw IException("FireModule: refugia raster resolution must match RU resolution.");
+      }
+      
+      // Verify raster dimensions
+      if (mRefugiaInputGrid.sizeX() != mRUGrid.sizeX() || mRefugiaInputGrid.sizeY() != mRUGrid.sizeY()) {
+        throw IException("FireModule: refugia raster dimensions must match RU grid.");
+      }
+      
+      // Verify raster origin
+      const QRectF inputRect = mRefugiaInputGrid.metricRect();
+      const QRectF ruRect = mRUGrid.metricRect();
+      
+      if (qAbs(inputRect.left() - ruRect.left()) > 0.001 || qAbs(inputRect.top() - ruRect.top()) > 0.001) {
+        throw IException("FireModule: refugia raster origin does not match RU grid."
+        );
+      }
+    }
 
     QString formula = xml.value(".mortalityFormula", "1/(1 + exp(-1.466 + 1.91*bt - 0.1775*bt*bt - 5.41*ck*ck))");
     mFormula_bt = mMortalityFormula.addVar("bt");
@@ -206,6 +252,38 @@ void FireModule::setup(const ResourceUnit *ru)
         throw IException("FireModule: grid not properly setup!");
     FireRUData &fire_data = data(ru);
     fire_data.setup(ru);
+    
+    // Initialize topo-climatic refugia modifier
+    setupRefugia(ru, fire_data);
+}
+
+void FireModule::setupRefugia(const ResourceUnit *ru, FireRUData &fire_data){
+  // Default: no refugia effect
+  fire_data.mRefugiaModifier = 1.0;
+  
+  if (!mRefugiaEnabled)
+    return;
+  
+  // Get the RU's spatial position
+  QPointF center = ru->boundingBox().center();
+  
+  // Verify the position lies within the input raster
+  if (!mRefugiaInputGrid.coordValid(center)) {
+    throw IException("FireModule: RU center lies outside refugia raster.");
+  }
+  
+  // Retrieve refugia potential
+  double R = mRefugiaInputGrid.constValueAt(center);
+  
+  // Validate refugia potential
+  if (R < 0.0 || R > 1.0) {
+    throw IException(QString("FireModule: invalid refugia potential (%1).")
+      arg(R)
+    );
+  }
+  
+  // Calculate and store the modifier
+  fire_data.mRefugiaModifier = 1.0 - mRefugiaAlpha * R;
 }
 
 /** yearBegin is called at the beginnig of every year.
@@ -886,10 +964,28 @@ bool FireModule::burnPixel(const QPoint &pos, FireRUData &ru_data)
     // (1) calculate fuel
     double fuel_moss,fuel_ff, fuel_dwd;
     double fuel = calcCombustibleFuel(ru_data, fuel_moss, fuel_ff, fuel_dwd); // kg BM/ha
+    
+    // Retrieve precomputed RU-level refugia modifier
+    const double refugiaModifier =
+      mRefugiaEnabled ? ru_data.mRefugiaModifier : 1.0;
+    
+    // Effective fuel for the two independently configurable effects
+    double fuelSpread = fuel;
+    double fuelSeverity = fuel;
+    
+    // Apply refugia to the minimum fuel threshold
+    if (mRefugiaEnabled && mRefugiaAffectSpread) {
+      fuelSpread *= refugiaModifier;
+    }
+    
+    // Apply refugia to crown-kill calculations
+    if (mRefugiaEnabled && mRefugiaAffectSeverity) {
+      fuelSeverity *= refugiaModifier;
+    }
 
     // if fuel level is below 0.05kg BM/m2 (=500kg/ha), then no burning happens!
     // note that it is not necessary that trees are on the pixel, as long as there is enough fuel on the ground.
-    if (fuel < mMinimumFuel)
+    if (fuelSpread < mMinimumFuel)
         return false;
 
     const double cell_fraction = cellsize()*cellsize() / cRUArea;
@@ -925,9 +1021,9 @@ bool FireModule::burnPixel(const QPoint &pos, FireRUData &ru_data)
     if (avg_dbh > dbh_trehshold)
         avg_dbh = dbh_trehshold;
 
-    double crown_kill_fraction = (kck1+kck2*avg_dbh)*fuel/1000.; // fuel: to t/ha
+    //double crown_kill_fraction = (kck1+kck2*avg_dbh)*fuel/1000.; // fuel: to t/ha
+    double crown_kill_fraction = (kck1 + kck2 * avg_dbh) * fuelSeverity / 1000.;
     crown_kill_fraction = limit(crown_kill_fraction, 0., 1.); // limit to 0..1
-
 
     // (3) derive mortality of single trees
     double p_mort;
